@@ -5,12 +5,12 @@
 # Compatible: busybox ash (TRB245)
 # Requires: awk, ubus, modbus_client.rpc
 #
-# Precision features:
-#  - Fast polling (0.3s) in throttle zone
-#  - Predictive close: accounts for pipe
-#    drain volume at current flow rate
-#  - Per-target adaptive calibration
-#  - Smooth quadratic valve curve from 80%
+# - Smooth quadratic valve curve
+# - Dynamic throttle start (fixed L window,
+#   not fixed %, so 100L behaves like 10L)
+# - Predictive close (flow rate × drain time)
+# - Per-target adaptive calibration
+# - Timeout scales with target volume
 ###########################################
 
 ###########################################
@@ -19,37 +19,41 @@
 
 TARGET_LITERS=10.0       # Target volume in liters
 CHECK_INTERVAL=1         # Polling interval before throttle zone (seconds)
-FAST_INTERVAL=300000     # Polling interval IN throttle zone (microseconds = 0.3s)
-RS485_MIN_GAP=0.25       # Reduced gap in throttle zone for faster response
+FAST_INTERVAL=300000     # Polling in throttle zone (microseconds = 0.3s)
+RS485_MIN_GAP=0.25       # Min gap between RS485 calls in throttle zone
 
 # Smooth throttle curve
-THROTTLE_START_PCT=80    # % of target filled → begin closing valve
+# THROTTLE_WINDOW_L: how many liters BEFORE target the curve starts
+# Fixed in liters — works correctly at any target size
+# e.g. 3.0 means: start throttling when 3L remains
+# Raise for larger targets if curve feels too abrupt
+THROTTLE_WINDOW_L=3.0
+
 VALVE_FULL_OPEN=9000     # Fully open position
 VALVE_MIN_TRICKLE=1800   # Minimum trickle (raise if flow stalls)
 CURVE_POWER=2.0          # 1.0=linear, 2.0=quadratic, 3.0=cubic
 
 # Predictive close:
-# Valve closes when: remaining <= CLOSE_OFFSET_L + (flow_rate * PIPE_DRAIN_TIME)
-# PIPE_DRAIN_TIME = seconds of flow still coming after valve closes
-# Measure this once: close valve, count how long water keeps flowing
-PIPE_DRAIN_TIME=2.0      # seconds of residual flow after valve close
-
-# Base close offset (calibrated per target)
-CLOSE_OFFSET_L=0.50
+# Valve closes when: remaining <= CLOSE_OFFSET_L + (flow_rate × PIPE_DRAIN_TIME)
+# Set PIPE_DRAIN_TIME = seconds water keeps flowing after valve closes
+PIPE_DRAIN_TIME=2.0
+CLOSE_OFFSET_L=0.30      # Base offset (calibrated per target)
 
 # Adaptive calibration
 CALIB_DIR="/var/run"
-CALIB_LEARNING_RATE=0.50  # 50% correction per run — converges in 3 runs
-CALIB_MAX_ADJUST=0.30     # Max shift per run in liters
+CALIB_LEARNING_RATE=0.50
+CALIB_MAX_ADJUST=0.30
 CALIB_MIN_OFFSET=0.00
-CALIB_MAX_OFFSET=2.50
-CALIB_DEADZONE=0.015      # Ignore errors under 15ml
+CALIB_MAX_OFFSET=3.00
+CALIB_DEADZONE=0.015
 
 # Stall recovery
 STALL_BUMP=200
 STALL_MAX_POS=4000
 STALL_AFTER=3
-STALL_TIMEOUT=90
+# Timeout scales automatically: THROTTLE_WINDOW_L / min_expected_flow_rate
+# Minimum 60s, calculated dynamically in main
+MIN_EXPECTED_FLOW=0.05   # L/s — slowest trickle you'd ever expect
 
 LOCKFILE="/var/run/flow_control.lock"
 
@@ -95,6 +99,7 @@ echo $$ > "$LOCKFILE"
 
 ###########################################
 # CALIBRATION (per target volume)
+# File: /var/run/flow_calib_<target>L.dat
 ###########################################
 
 calib_file() {
@@ -246,18 +251,19 @@ set_valve_position() {
 
 ###########################################
 # SMOOTH VALVE CURVE
+#
+# Throttle window is fixed in LITERS:
+#   remaining > THROTTLE_WINDOW_L  → full open
+#   effective_close < rem ≤ window → smooth curve
+#   remaining ≤ effective_close    → closed
 ###########################################
 
 get_smooth_valve_pos() {
     remaining="$1"
-    effective_close="$2"   # CLOSE_OFFSET_L + predictive drain volume
-
-    throttle_start_rem=$(awk "BEGIN {
-        printf \"%.4f\", $TARGET_LITERS * (1 - $THROTTLE_START_PCT / 100)
-    }")
+    effective_close="$2"
 
     # Full open zone
-    in_throttle=$(awk "BEGIN { print ($remaining <= $throttle_start_rem) ? 1 : 0 }")
+    in_throttle=$(awk "BEGIN { print ($remaining <= $THROTTLE_WINDOW_L) ? 1 : 0 }")
     if [ "$in_throttle" -eq 0 ]; then
         echo "$VALVE_FULL_OPEN"
         return
@@ -270,11 +276,11 @@ get_smooth_valve_pos() {
         return
     fi
 
-    # Smooth curve zone
+    # Smooth curve: progress 0.0 (entered throttle) → 1.0 (about to close)
     pos=$(awk "BEGIN {
-        range = $throttle_start_rem - $effective_close
+        range = $THROTTLE_WINDOW_L - $effective_close
         if (range <= 0) { print $CURRENT_TRICKLE_MIN; exit }
-        progress = ($throttle_start_rem - $remaining) / range
+        progress = ($THROTTLE_WINDOW_L - $remaining) / range
         if (progress < 0) progress = 0
         if (progress > 1) progress = 1
         curved = progress ^ $CURVE_POWER
@@ -326,16 +332,23 @@ wait_for_flow() {
 
 load_calibration
 
-throttle_start_L=$(awk "BEGIN { printf \"%.2f\", $TARGET_LITERS * $THROTTLE_START_PCT / 100 }")
+# Dynamic timeout: time to drain THROTTLE_WINDOW_L at minimum expected flow
+# + generous 60s buffer. Scales with window size automatically.
+STALL_TIMEOUT=$(awk "BEGIN {
+    t = ($THROTTLE_WINDOW_L / $MIN_EXPECTED_FLOW) + 60
+    printf \"%d\", t
+}")
+
+throttle_start_L=$(awk "BEGIN { printf \"%.3f\", $TARGET_LITERS - $THROTTLE_WINDOW_L }")
 
 echo "======================================="
 echo " Flow Control  (PID $$)"
-echo " Target    : ${TARGET_LITERS} L"
-echo " Throttle  : smooth curve from ${throttle_start_L}L (${THROTTLE_START_PCT}%)"
-echo " Curve     : power=${CURVE_POWER} | ${VALVE_FULL_OPEN} → ${VALVE_MIN_TRICKLE}"
-echo " Close at  : ${CLOSE_OFFSET_L}L base + predictive (${PIPE_DRAIN_TIME}s drain)"
-echo " Polling   : ${CHECK_INTERVAL}s normal / 0.3s in throttle zone"
-echo " Stall     : bump +${STALL_BUMP} after ${STALL_AFTER}s, max=${STALL_MAX_POS}"
+echo " Target      : ${TARGET_LITERS} L"
+echo " Throttle    : last ${THROTTLE_WINDOW_L}L (from ${throttle_start_L}L)"
+echo " Curve       : power=${CURVE_POWER} | ${VALVE_FULL_OPEN} → ${VALVE_MIN_TRICKLE}"
+echo " Close offset: ${CLOSE_OFFSET_L}L base + predictive (${PIPE_DRAIN_TIME}s drain)"
+echo " Timeout     : ${STALL_TIMEOUT}s in throttle zone"
+echo " Polling     : ${CHECK_INTERVAL}s normal / 0.3s in throttle zone"
 echo "======================================="
 
 log "RS485 bus settling..."
@@ -349,11 +362,10 @@ wait_for_flow
 
 log "Monitoring..."
 
-flow_rate="0.0000"
+flow_rate="0.1500"   # Seed with reasonable default so predictive close works immediately
 
 while true; do
 
-    # Use fast polling in throttle zone, normal polling before it
     if [ "$IN_THROTTLE" -eq 1 ]; then
         usleep "$FAST_INTERVAL"
     else
@@ -366,9 +378,9 @@ while true; do
     delta_vol=$(awk "BEGIN { print $curr_flow - $prev_flow }")
     delta_t=$(awk "BEGIN { print $curr_time - $prev_time }")
 
-    # Update flow rate only when delta_t is meaningful
+    # Only update flow rate when we have a meaningful time window
     new_rate=$(awk "BEGIN {
-        if ($delta_t > 0.1)
+        if ($delta_t > 0.1 && $delta_vol >= 0)
             printf \"%.4f\", $delta_vol / $delta_t
         else
             print \"$flow_rate\"
@@ -378,12 +390,10 @@ while true; do
     filled_pct=$(awk "BEGIN { printf \"%.1f\", ($curr_flow / $TARGET_LITERS) * 100 }")
     remaining=$(awk "BEGIN { printf \"%.3f\", $TARGET_LITERS - $curr_flow }")
 
-    # Predictive close threshold:
-    # = base calibrated offset + volume that will drain during pipe drain time
-    # This adapts automatically to both fast and slow flow rates
+    # Predictive close threshold (adapts to current flow rate)
     effective_close=$(awk "BEGIN {
-        drain_vol = $flow_rate * $PIPE_DRAIN_TIME
-        total = $CLOSE_OFFSET_L + drain_vol
+        drain = $flow_rate * $PIPE_DRAIN_TIME
+        total = $CLOSE_OFFSET_L + drain
         if (total < $CLOSE_OFFSET_L) total = $CLOSE_OFFSET_L
         printf \"%.4f\", total
     }")
@@ -391,24 +401,26 @@ while true; do
     target_pos=$(get_smooth_valve_pos "$remaining" "$effective_close")
 
     # Throttle zone entry
-    throttle_start_rem=$(awk "BEGIN {
-        printf \"%.4f\", $TARGET_LITERS * (1 - $THROTTLE_START_PCT / 100)
-    }")
     entering=$(awk "BEGIN {
-        print ($remaining <= $throttle_start_rem && $IN_THROTTLE == 0) ? 1 : 0
+        print ($remaining <= $THROTTLE_WINDOW_L && $IN_THROTTLE == 0) ? 1 : 0
     }")
     if [ "$entering" -eq 1 ]; then
         IN_THROTTLE=1
         THROTTLE_START_TIME=$(date +%s)
-        log "Throttle active — ${curr_flow}L filled, ${remaining}L rem, rate=${flow_rate}L/s"
-        log "Predictive close: base=${CLOSE_OFFSET_L}L + drain=${PIPE_DRAIN_TIME}s × ${flow_rate}L/s = ${effective_close}L"
+        log "━━━ Throttle active ━━━"
+        log "  Filled   : ${curr_flow}L (${filled_pct}%)"
+        log "  Remaining: ${remaining}L"
+        log "  Rate     : ${flow_rate}L/s"
+        log "  Close at : ${CLOSE_OFFSET_L}L base + ${flow_rate}L/s × ${PIPE_DRAIN_TIME}s = ${effective_close}L"
+        log "  Timeout  : ${STALL_TIMEOUT}s"
     fi
 
-    # Stall detection & recovery (throttle zone only)
+    # Stall detection & recovery
     if [ "$IN_THROTTLE" -eq 1 ] && [ "$target_pos" -ne 0 ]; then
 
         now_s=$(date +%s)
         elapsed=$((now_s - THROTTLE_START_TIME))
+
         if [ "$elapsed" -ge "$STALL_TIMEOUT" ]; then
             log "TIMEOUT: ${elapsed}s in throttle, closing. Meter: $curr_flow L"
             set_valve_position 0
@@ -438,10 +450,10 @@ while true; do
         fi
     fi
 
-    printf "[%s] %6.3f / %s L | %5.1f%% | rem: %s L | %.4f L/s | close@: %sL | valve: %s\n" \
+    printf "[%s] %7.3f / %-6s L | %5.1f%% | rem: %6.3f L | %6.4f L/s | valve: %4s\n" \
         "$(date '+%H:%M:%S')" \
         "$curr_flow" "$TARGET_LITERS" "$filled_pct" "$remaining" \
-        "$flow_rate" "$effective_close" "$target_pos"
+        "$flow_rate" "$target_pos"
 
     set_valve_position "$target_pos"
 
@@ -454,9 +466,10 @@ while true; do
     prev_time=$curr_time
 done
 
-# Wait for pipe to fully drain then read final
+# Wait for pipe to drain
 sleep_drain=$(awk "BEGIN { printf \"%d\", $PIPE_DRAIN_TIME + 2 }")
 sleep "$sleep_drain"
+
 final_flow=$(read_flow_meter)
 overshoot=$(awk "BEGIN { printf \"%.3f\", $final_flow - $TARGET_LITERS }")
 
@@ -467,7 +480,6 @@ log "  Error  : ${overshoot} L"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 update_calibration "$overshoot"
-
 reset_flow_meter
 
 echo "======================================="
