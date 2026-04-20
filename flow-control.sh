@@ -3,43 +3,42 @@
 ###########################################
 # FLOW CONTROL SCRIPT - HIGH PRECISION
 # Compatible: busybox ash (TRB245)
-# Requires: awk, ubus, modbus_client.rpc
+# Requires: awk, ubus, modbus_client.rpc, curl
 #
+# - Fetches target volume from remote config URL at startup
+# - Prompts user to select a flow meter
+# - Offline indicator: valve opens/closes if URL unreachable
 # - Smooth quadratic valve curve
-# - Dynamic throttle start (fixed L window,
-#   not fixed %, so 100L behaves like 10L)
+# - Dynamic throttle start (fixed L window)
 # - Predictive close (flow rate × drain time)
 # - Per-target adaptive calibration
 # - Timeout scales with target volume
 ###########################################
 
 ###########################################
-# CONFIGURATION
+# REMOTE CONFIG
 ###########################################
 
-TARGET_LITERS=10.0       # Target volume in liters
-CHECK_INTERVAL=1         # Polling interval before throttle zone (seconds)
-FAST_INTERVAL=300000     # Polling in throttle zone (microseconds = 0.3s)
-RS485_MIN_GAP=0.25       # Min gap between RS485 calls in throttle zone
+CONFIG_URL="https://flow-control.time-net.net/rates.json"
+CONFIG_FETCH_TIMEOUT=5      # seconds to wait for HTTP response
 
-# Smooth throttle curve
-# THROTTLE_WINDOW_L: how many liters BEFORE target the curve starts
-# Fixed in liters — works correctly at any target size
-# e.g. 3.0 means: start throttling when 3L remains
-# Raise for larger targets if curve feels too abrupt
+###########################################
+# CONFIGURATION (fallback / static)
+###########################################
+
+CHECK_INTERVAL=1            # Polling interval before throttle zone (seconds)
+FAST_INTERVAL=300000        # Polling in throttle zone (microseconds = 0.3s)
+RS485_MIN_GAP=0.25          # Min gap between RS485 calls in throttle zone
+
 THROTTLE_WINDOW_L=3.0
 
-VALVE_FULL_OPEN=9000     # Fully open position
-VALVE_MIN_TRICKLE=1800   # Minimum trickle (raise if flow stalls)
-CURVE_POWER=2.0          # 1.0=linear, 2.0=quadratic, 3.0=cubic
+VALVE_FULL_OPEN=9000
+VALVE_MIN_TRICKLE=1800
+CURVE_POWER=2.0
 
-# Predictive close:
-# Valve closes when: remaining <= CLOSE_OFFSET_L + (flow_rate × PIPE_DRAIN_TIME)
-# Set PIPE_DRAIN_TIME = seconds water keeps flowing after valve closes
 PIPE_DRAIN_TIME=2.0
-CLOSE_OFFSET_L=0.30      # Base offset (calibrated per target)
+CLOSE_OFFSET_L=0.30
 
-# Adaptive calibration
 CALIB_DIR="/var/run"
 CALIB_LEARNING_RATE=0.50
 CALIB_MAX_ADJUST=0.30
@@ -47,13 +46,10 @@ CALIB_MIN_OFFSET=0.00
 CALIB_MAX_OFFSET=3.00
 CALIB_DEADZONE=0.015
 
-# Stall recovery
 STALL_BUMP=200
 STALL_MAX_POS=4000
 STALL_AFTER=3
-# Timeout scales automatically: THROTTLE_WINDOW_L / min_expected_flow_rate
-# Minimum 60s, calculated dynamically in main
-MIN_EXPECTED_FLOW=0.05   # L/s — slowest trickle you'd ever expect
+MIN_EXPECTED_FLOW=0.05
 
 LOCKFILE="/var/run/flow_control.lock"
 
@@ -67,6 +63,10 @@ THROTTLE_START_TIME=0
 IN_THROTTLE=0
 ZERO_RATE_COUNT=0
 CURRENT_TRICKLE_MIN=$VALVE_MIN_TRICKLE
+
+TARGET_LITERS=""
+METER_ID=""
+METER_NAME=""
 
 ###########################################
 # LOGGING
@@ -98,8 +98,134 @@ fi
 echo $$ > "$LOCKFILE"
 
 ###########################################
+# OFFLINE INDICATOR
+# Open valve fully, then close — visual
+# signal that the device is offline.
+###########################################
+
+offline_indicator() {
+    log "OFFLINE: Cannot reach config server."
+    log "Signalling offline: opening valve..."
+    modbus_call 16 2 "$VALVE_FULL_OPEN" 2 >/dev/null
+    sleep 2
+    log "Signalling offline: closing valve..."
+    modbus_call 16 2 0 2 >/dev/null
+    sleep 1
+    log "Signalling offline: opening valve..."
+    modbus_call 16 2 "$VALVE_FULL_OPEN" 2 >/dev/null
+    sleep 2
+    log "Signalling offline: closing valve..."
+    modbus_call 16 2 0 2 >/dev/null
+    log "Offline indicator done. Exiting."
+    exit 1
+}
+
+###########################################
+# FETCH REMOTE CONFIG
+# Parses the JSON from CONFIG_URL and
+# populates METER_LIST_* variables.
+# Sets FETCH_OK=1 on success, 0 on failure.
+###########################################
+
+FETCH_OK=0
+METER_COUNT=0
+
+fetch_remote_config() {
+    log "Fetching config from: $CONFIG_URL"
+
+    response=$(curl \
+        --silent \
+        --fail \
+        --connect-timeout "$CONFIG_FETCH_TIMEOUT" \
+        --max-time "$CONFIG_FETCH_TIMEOUT" \
+        "$CONFIG_URL" 2>/dev/null)
+
+    if [ -z "$response" ]; then
+        log "WARNING: Empty or no response from config server."
+        FETCH_OK=0
+        return
+    fi
+
+    # Parse meter count — count occurrences of "id":
+    METER_COUNT=$(echo "$response" | grep -o '"id"' | wc -l | tr -d ' ')
+
+    if [ -z "$METER_COUNT" ] || [ "$METER_COUNT" -eq 0 ]; then
+        log "WARNING: Could not parse any meters from response."
+        FETCH_OK=0
+        return
+    fi
+
+    # Parse each meter's id, name, target_liters using awk
+    # Store in indexed shell variables: METER_ID_1, METER_NAME_1, METER_TARGET_1 ...
+    eval "$(echo "$response" | awk '
+    BEGIN {
+        n = 0
+        id = ""; name = ""; target = ""
+    }
+    {
+        line = $0
+        # Extract id
+        if (match(line, /"id":[[:space:]]*[0-9]+/)) {
+            s = substr(line, RSTART, RLENGTH)
+            gsub(/[^0-9]/, "", s)
+            id = s
+        }
+        # Extract name (value between quotes after "name":)
+        if (match(line, /"name":[[:space:]]*"[^"]*"/)) {
+            s = substr(line, RSTART, RLENGTH)
+            sub(/.*"name":[[:space:]]*"/, "", s)
+            sub(/".*/, "", s)
+            name = s
+        }
+        # Extract target_liters
+        if (match(line, /"target_liters":[[:space:]]*[0-9]+(\.[0-9]+)?/)) {
+            s = substr(line, RSTART, RLENGTH)
+            sub(/.*"target_liters":[[:space:]]*/, "", s)
+            target = s
+        }
+        # When we have all three, emit a set of assignments
+        if (id != "" && name != "" && target != "") {
+            n++
+            printf "METER_ID_%d=\"%s\"\n", n, id
+            printf "METER_NAME_%d=\"%s\"\n", n, name
+            printf "METER_TARGET_%d=\"%s\"\n", n, target
+            id = ""; name = ""; target = ""
+        }
+    }
+    END {
+        printf "METER_COUNT=%d\n", n
+    }
+    ')"
+
+    if [ "$METER_COUNT" -eq 0 ]; then
+        log "WARNING: Parsed 0 meters from config."
+        FETCH_OK=0
+        return
+    fi
+
+    FETCH_OK=1
+    log "Config loaded: $METER_COUNT meter(s) found."
+}
+
+###########################################
+# PROMPT USER TO SELECT A METER
+###########################################
+
+prompt_meter_selection() {
+    # Always use meter 1 (العداد الأول)
+    # Other meters are defined in the remote config but not used here:
+    #   [2] العداد الثاني — Target: 5L
+    #   [3] العداد الثالث — Target: 3L
+
+    METER_ID="$METER_ID_1"
+    METER_NAME="$METER_NAME_1"
+    TARGET_LITERS="$METER_TARGET_1"
+
+    log "Using meter: [$METER_ID] $METER_NAME — Target: ${TARGET_LITERS}L"
+}
+
+###########################################
 # CALIBRATION (per target volume)
-# File: /var/run/flow_calib_<target>L.dat
 ###########################################
 
 calib_file() {
@@ -251,32 +377,24 @@ set_valve_position() {
 
 ###########################################
 # SMOOTH VALVE CURVE
-#
-# Throttle window is fixed in LITERS:
-#   remaining > THROTTLE_WINDOW_L  → full open
-#   effective_close < rem ≤ window → smooth curve
-#   remaining ≤ effective_close    → closed
 ###########################################
 
 get_smooth_valve_pos() {
     remaining="$1"
     effective_close="$2"
 
-    # Full open zone
     in_throttle=$(awk "BEGIN { print ($remaining <= $THROTTLE_WINDOW_L) ? 1 : 0 }")
     if [ "$in_throttle" -eq 0 ]; then
         echo "$VALVE_FULL_OPEN"
         return
     fi
 
-    # Close zone
     should_close=$(awk "BEGIN { print ($remaining <= $effective_close) ? 1 : 0 }")
     if [ "$should_close" -eq 1 ]; then
         echo "0"
         return
     fi
 
-    # Smooth curve: progress 0.0 (entered throttle) → 1.0 (about to close)
     pos=$(awk "BEGIN {
         range = $THROTTLE_WINDOW_L - $effective_close
         if (range <= 0) { print $CURRENT_TRICKLE_MIN; exit }
@@ -327,13 +445,23 @@ wait_for_flow() {
 }
 
 ###########################################
-# MAIN
+# STARTUP: FETCH CONFIG → SELECT METER
 ###########################################
+
+fetch_remote_config
+
+if [ "$FETCH_OK" -eq 0 ]; then
+    offline_indicator
+fi
+
+prompt_meter_selection
 
 load_calibration
 
-# Dynamic timeout: time to drain THROTTLE_WINDOW_L at minimum expected flow
-# + generous 60s buffer. Scales with window size automatically.
+###########################################
+# MAIN
+###########################################
+
 STALL_TIMEOUT=$(awk "BEGIN {
     t = ($THROTTLE_WINDOW_L / $MIN_EXPECTED_FLOW) + 60
     printf \"%d\", t
@@ -343,6 +471,7 @@ throttle_start_L=$(awk "BEGIN { printf \"%.3f\", $TARGET_LITERS - $THROTTLE_WIND
 
 echo "======================================="
 echo " Flow Control  (PID $$)"
+echo " Meter       : [$METER_ID] $METER_NAME"
 echo " Target      : ${TARGET_LITERS} L"
 echo " Throttle    : last ${THROTTLE_WINDOW_L}L (from ${throttle_start_L}L)"
 echo " Curve       : power=${CURVE_POWER} | ${VALVE_FULL_OPEN} → ${VALVE_MIN_TRICKLE}"
@@ -362,7 +491,7 @@ wait_for_flow
 
 log "Monitoring..."
 
-flow_rate="0.1500"   # Seed with reasonable default so predictive close works immediately
+flow_rate="0.1500"
 
 while true; do
 
@@ -378,7 +507,6 @@ while true; do
     delta_vol=$(awk "BEGIN { print $curr_flow - $prev_flow }")
     delta_t=$(awk "BEGIN { print $curr_time - $prev_time }")
 
-    # Only update flow rate when we have a meaningful time window
     new_rate=$(awk "BEGIN {
         if ($delta_t > 0.1 && $delta_vol >= 0)
             printf \"%.4f\", $delta_vol / $delta_t
@@ -390,7 +518,6 @@ while true; do
     filled_pct=$(awk "BEGIN { printf \"%.1f\", ($curr_flow / $TARGET_LITERS) * 100 }")
     remaining=$(awk "BEGIN { printf \"%.3f\", $TARGET_LITERS - $curr_flow }")
 
-    # Predictive close threshold (adapts to current flow rate)
     effective_close=$(awk "BEGIN {
         drain = $flow_rate * $PIPE_DRAIN_TIME
         total = $CLOSE_OFFSET_L + drain
@@ -400,7 +527,6 @@ while true; do
 
     target_pos=$(get_smooth_valve_pos "$remaining" "$effective_close")
 
-    # Throttle zone entry
     entering=$(awk "BEGIN {
         print ($remaining <= $THROTTLE_WINDOW_L && $IN_THROTTLE == 0) ? 1 : 0
     }")
@@ -415,7 +541,6 @@ while true; do
         log "  Timeout  : ${STALL_TIMEOUT}s"
     fi
 
-    # Stall detection & recovery
     if [ "$IN_THROTTLE" -eq 1 ] && [ "$target_pos" -ne 0 ]; then
 
         now_s=$(date +%s)
@@ -466,7 +591,6 @@ while true; do
     prev_time=$curr_time
 done
 
-# Wait for pipe to drain
 sleep_drain=$(awk "BEGIN { printf \"%d\", $PIPE_DRAIN_TIME + 2 }")
 sleep "$sleep_drain"
 
